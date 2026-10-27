@@ -1,21 +1,23 @@
 {
   "name": "university-fleet-management",
-  "version": "1.0.0",
-  "main": "index.js",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Web-Based University Fleet Management System with real-time tracking and predictive maintenance (ABU Zaria)",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "install:all": "npm install && npm install --prefix backend && npm install --prefix frontend",
+    "dev": "concurrently -n api,web -c green,cyan \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "dev:all": "concurrently -n api,web,gps -c green,cyan,yellow \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\" \"npm run simulator --prefix backend\"",
+    "db:init": "npm run db:init --prefix backend",
+    "db:reset": "npm run db:reset --prefix backend",
+    "seed:admin": "npm run seed:admin --prefix backend",
+    "seed:demo": "npm run seed:demo --prefix backend",
+    "simulator": "npm run simulator --prefix backend",
+    "test": "npm test --prefix backend",
+    "lint": "npm run lint --prefix frontend",
+    "build": "npm run build --prefix frontend"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
-  "dependencies": {
-    "bcrypt": "^6.0.0",
-    "cookie-parser": "^1.4.7",
-    "cors": "^2.8.6",
-    "dotenv": "^18.0.8",
-    "express": "^5.3.0",
-    "jsonwebtoken": "^9.0.3",
-    "mysql2": "^3.24.6"
-  }
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  },
+  "license": "ISC"
 }

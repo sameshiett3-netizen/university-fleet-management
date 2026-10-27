@@ -1,57 +1,63 @@
-import { useState, useContext } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { AuthContext } from '../context/AuthContext';
+import { useState } from 'react';
+import { Navigate, useNavigate } from 'react-router-dom';
+import { homePathFor, useAuth } from '../context/AuthContext';
+import { errorMessage } from '../api/axios';
+import Spinner from '../components/Spinner';
 
 export default function Login() {
-    // I've pre-filled your admin credentials so you don't have to type them every time during development
-    const [email, setEmail] = useState('admin@abu.edu.ng'); 
-    const [password, setPassword] = useState('admin123');
-    const [error, setError] = useState('');
-    const { login } = useContext(AuthContext);
+    const { user, loading, login } = useAuth();
     const navigate = useNavigate();
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [showPassword, setShowPassword] = useState(false);
+    const [error, setError] = useState('');
+    const [busy, setBusy] = useState(false);
+
+    if (loading) return <Spinner full label="Loading..." />;
+    if (user) return <Navigate to={homePathFor(user)} replace />;
 
     const handleSubmit = async (e) => {
         e.preventDefault();
+        setError('');
+        setBusy(true);
         try {
-            await login(email, password);
-            navigate('/admin'); // Redirect to dashboard on success
+            const u = await login(email.trim(), password);
+            navigate(homePathFor(u), { replace: true });
         } catch (err) {
-            setError('Invalid email or password');
+            setError(errorMessage(err, 'Login failed. Please try again.'));
+        } finally {
+            setBusy(false);
         }
     };
 
     return (
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: '100px', fontFamily: 'sans-serif' }}>
-            <h1 style={{ fontSize: '2rem', marginBottom: '20px' }}>University Fleet Management</h1>
-            <div style={{ padding: '30px', border: '1px solid #ccc', borderRadius: '8px', width: '350px', boxShadow: '0 4px 8px rgba(0,0,0,0.1)' }}>
-                <h2 style={{ textAlign: 'center', marginBottom: '20px' }}>Admin Login</h2>
-                {error && <p style={{ color: 'red', textAlign: 'center', marginBottom: '15px' }}>{error}</p>}
-                
-                <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
-                    <input 
-                        type="email" 
-                        value={email} 
-                        onChange={(e) => setEmail(e.target.value)} 
-                        placeholder="Email" 
-                        required 
-                        style={{ padding: '10px', borderRadius: '4px', border: '1px solid #aaa' }} 
-                    />
-                    <input 
-                        type="password" 
-                        value={password} 
-                        onChange={(e) => setPassword(e.target.value)} 
-                        placeholder="Password" 
-                        required 
-                        style={{ padding: '10px', borderRadius: '4px', border: '1px solid #aaa' }} 
-                    />
-                    <button 
-                        type="submit" 
-                        style={{ padding: '12px', backgroundColor: '#0056b3', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
-                    >
-                        Sign In
-                    </button>
+        <div className="login-page">
+            <section className="login-hero">
+                <img src="/abu-logo-white.png" alt="Ahmadu Bello University logo" />
+                <h1>University Fleet Management System</h1>
+                <p>Real-time vehicle tracking, trip dispatch and predictive maintenance for the Ahmadu Bello University motor pool.</p>
+                <small>Ahmadu Bello University, Zaria</small>
+            </section>
+            <section className="login-panel">
+                <form className="login-card" onSubmit={handleSubmit}>
+                    <img className="login-mobile-logo" src="/abu-logo.png" alt="" />
+                    <h2>Sign in</h2>
+                    <p className="muted">Use the account issued by the transport office.</p>
+                    {error && <div className="alert alert-error" role="alert">{error}</div>}
+                    <label className="field">
+                        <span>Email address</span>
+                        <input type="email" autoComplete="username" value={email} onChange={(e) => setEmail(e.target.value)} required autoFocus />
+                    </label>
+                    <label className="field">
+                        <span>Password</span>
+                        <div className="input-row">
+                            <input type={showPassword ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+                            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowPassword((s) => !s)}>{showPassword ? 'Hide' : 'Show'}</button>
+                        </div>
+                    </label>
+                    <button type="submit" className="btn btn-primary btn-block" disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
                 </form>
-            </div>
+            </section>
         </div>
     );
 }
