@@ -1,179 +1,83 @@
-require('dotenv').config();
-const mysql = require('mysql2/promise');
+// GPS simulator: a stand-alone client that drives every Active trip from the Fleet Garage to its destination
+// and posts a coordinate every few seconds to POST /api/tracking/location (authenticated by SIMULATOR_SECRET).
+// It never touches the database: trip completion and odometer updates belong to the driver (via the API).
+const { config, assertSecrets } = require('../config/env');
+const { GARAGE } = require('../config/locations');
 
-const SIMULATOR_SECRET = process.env.SIMULATOR_SECRET;
+assertSecrets();
 
-// 1. Hardcoded exact GPS coordinates for ABU Zaria landmarks
-const ABU_COORDS = {
-    "Senate Building": { lat: 11.1534, lng: 7.6523 },
-    "Samaru Main Gate": { lat: 11.1598, lng: 7.6439 },
-    "University Health Services (Sick Bay)": { lat: 11.1492, lng: 7.6471 },
-    "Kashim Ibrahim Library (KIL)": { lat: 11.1528, lng: 7.6465 },
-    "Danfodio Hall": { lat: 11.1539, lng: 7.6465 },
-    "Faculty of Engineering": { lat: 11.1505, lng: 7.6490 },
-    "Faculty of Arts": { lat: 11.1545, lng: 7.6480 },
-    "Amina Hall": { lat: 11.1510, lng: 7.6440 },
-    "Faculty of Law (Kongo Campus)": { lat: 11.1130, lng: 7.6320 },
-    "Mamman Kontagora Square": { lat: 11.1520, lng: 7.6495 },
-    "Iya Abubakar Institute of Information and Computer Technology (IAIICT)": { lat: 11.1515, lng: 7.6510 },
-    // Default starting point for idle vehicles
-    "Fleet Garage": { lat: 11.1580, lng: 7.6450 } 
-};
+const API_URL = process.env.API_URL || `http://localhost:${config.port}/api`;
+const INTERVAL_MS = Number(process.env.SIMULATOR_INTERVAL_MS) || 2000;
+const USE_OSRM = process.env.SIMULATOR_USE_OSRM !== 'false';
+const headers = { 'Content-Type': 'application/json', 'X-Simulator-Secret': config.simulatorSecret };
 
-const activeSimulations = new Set();
+const running = new Set();     // trips currently being simulated
+const activeNow = new Set();   // trips the API currently reports as Active
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function getRoadRoute(start, end) {
+function haversineKm(a, b) {
+    const R = 6371; const rad = (d) => (d * Math.PI) / 180;
+    const dLat = rad(b.lat - a.lat); const dLng = rad(b.lng - a.lng);
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// Road route from the public OSRM server; falls back to a straight line when offline so demos never stall.
+async function getRoute(from, to) {
+    if (USE_OSRM) {
+        try {
+            const url = `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=full&geometries=geojson`;
+            const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+            const data = await res.json();
+            if (data.routes && data.routes[0]) {
+                return { points: data.routes[0].geometry.coordinates.map(([lng, lat]) => ({ lat, lng })), distanceKm: data.routes[0].distance / 1000, source: 'OSRM road route' };
+            }
+        } catch (_) { /* fall through to the straight-line route */ }
+    }
+    const steps = 60;
+    const points = Array.from({ length: steps + 1 }, (_, i) => ({ lat: from.lat + ((to.lat - from.lat) * i) / steps, lng: from.lng + ((to.lng - from.lng) * i) / steps }));
+    return { points, distanceKm: haversineKm(from, to), source: 'straight-line fallback' };
+}
+
+async function simulateTrip(trip) {
+    const id = trip.trip_id;
     try {
-        const url = `http://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson`;
-        const response = await fetch(url);
-        const data = await response.json();
-        
-        return {
-            coordinates: data.routes[0].geometry.coordinates,
-            distanceKm: data.routes[0].distance / 1000 // Convert meters to kilometers
-        };
+        if (!trip.destination_coords) { console.log(`Trip ${id}: destination "${trip.destination}" has no coordinates; skipping.`); return; }
+        const route = await getRoute(GARAGE, trip.destination_coords);
+        console.log(`Trip ${id}: driving to ${trip.destination} (${route.points.length} points, ${route.distanceKm.toFixed(2)} km, ${route.source}).`);
+
+        for (const p of route.points) {
+            if (!activeNow.has(id)) { console.log(`Trip ${id} is no longer active; stopping.`); return; }
+            const res = await fetch(`${API_URL}/tracking/location`, { method: 'POST', headers, body: JSON.stringify({ trip_id: id, latitude: p.lat, longitude: p.lng }) });
+            if (res.status === 409 || res.status === 404) { console.log(`Trip ${id} was closed by the server; stopping.`); return; }
+            if (!res.ok) console.error(`Trip ${id}: server answered ${res.status}`);
+            await sleep(INTERVAL_MS);
+        }
+        console.log(`Trip ${id}: arrived at ${trip.destination}. Route distance ${route.distanceKm.toFixed(2)} km. The driver can now complete the trip with the final odometer reading.`);
+        // Stay "running" until the trip leaves the Active list so it is not replayed
+        while (activeNow.has(id)) await sleep(INTERVAL_MS);
     } catch (error) {
-        console.error("OSRM Routing Error:", error.message);
-        return { coordinates: [], distanceKm: 0 };
+        console.error(`Trip ${id}: simulation error: ${error.message}`);
+    } finally {
+        running.delete(id);
     }
 }
 
-async function runSimulator() {
-    const db = await mysql.createConnection({
-        host: '127.0.0.1',
-        user: process.env.DB_USER || 'root',
-        password: process.env.DB_PASSWORD || '',
-        database: 'fleet_db',
-        port: 3307
-    });
-
-    console.log('📡 Smart GPS Simulator connected. Scanning for active trips...');
-
-    async function simulateTrip(tripId, destinationName) {
-        const startCoords = ABU_COORDS["Fleet Garage"];
-        const endCoords = ABU_COORDS[destinationName] || ABU_COORDS["Samaru Main Gate"]; 
-
-        console.log(`🗺️ Calculating road route for Trip ${tripId} to ${destinationName}...`);
-        
-        const routeData = await getRoadRoute(startCoords, endCoords);
-        const roadPoints = routeData.coordinates;
-        const tripDistanceKm = routeData.distanceKm;
-
-        if (!roadPoints || roadPoints.length === 0) {
-            activeSimulations.delete(tripId);
-            return;
+async function poll() {
+    try {
+        const res = await fetch(`${API_URL}/tracking/simulator/trips`, { headers });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const trips = await res.json();
+        activeNow.clear();
+        for (const t of trips) {
+            activeNow.add(t.trip_id);
+            if (!running.has(t.trip_id)) { running.add(t.trip_id); simulateTrip(t); }
         }
-
-        console.log(`🚗 Route found! Trip ${tripId} is on the move. (${roadPoints.length} road coordinates, Distance: ${tripDistanceKm.toFixed(2)} km)`);
-
-        // Mark trip as In Progress in DB so it doesn't get re-scanned
-        await db.execute('UPDATE trips SET status = "In Progress" WHERE trip_id = ?', [tripId]);
-
-        for (let i = 0; i < roadPoints.length; i++) {
-            // Check if trip was terminated/cancelled mid-route from the dashboard
-            try {
-                const [checkRows] = await db.execute('SELECT status FROM trips WHERE trip_id = ?', [tripId]);
-                if (checkRows.length === 0 || checkRows[0].status === 'Cancelled') {
-                    console.log(`🛑 Trip ${tripId} was cancelled/terminated mid-route. Stopping simulation.`);
-                    activeSimulations.delete(tripId);
-                    return;
-                }
-            } catch (err) {
-                console.error("Mid-route status check error:", err.message);
-            }
-
-            const [lng, lat] = roadPoints[i];
-
-            try {
-                const response = await fetch('http://localhost:5000/api/telemetry/simulate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        trip_id: tripId,
-                        latitude: lat,
-                        longitude: lng,
-                        destination: destinationName,
-                        secret: SIMULATOR_SECRET
-                    })
-                });
-
-                if (response.ok) {
-                    console.log(`📍 Broadcasted Trip ${tripId}: Lat ${lat.toFixed(5)}, Lng ${lng.toFixed(5)}`);
-                }
-            } catch (error) {
-                console.error(`Trip ${tripId} transmission failed.`);
-            }
-
-            await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-
-        console.log(`🏁 Trip ${tripId} has arrived at ${destinationName}! (+${tripDistanceKm.toFixed(2)} km)`);
-        
-        // 1. Mark trip as Completed in the database
-        await db.execute('UPDATE trips SET status = "Completed" WHERE trip_id = ?', [tripId]);
-
-        // 2. Fetch vehicle_id for this trip and increment its odometer
-        const [tripRows] = await db.execute('SELECT vehicle_id FROM trips WHERE trip_id = ?', [tripId]);
-        if (tripRows.length > 0) {
-            const vehicleId = tripRows[0].vehicle_id;
-            await db.execute('UPDATE vehicles SET odometer = odometer + ? WHERE vehicle_id = ?', [tripDistanceKm, vehicleId]);
-            console.log(`🔧 Vehicle ID ${vehicleId} odometer successfully updated (+${tripDistanceKm.toFixed(2)} km).`);
-
-            // --- PREDICTIVE MAINTENANCE THRESHOLD CHECK ---
-            const MAINTENANCE_INTERVAL = 5000;
-            const [vehicleRows] = await db.execute('SELECT odometer FROM vehicles WHERE vehicle_id = ?', [vehicleId]);
-
-            if (vehicleRows.length > 0) {
-                const currentOdometer = vehicleRows[0].odometer;
-                
-                // Check if crossing a new 5,000 km threshold
-                if (currentOdometer > 0 && Math.floor(currentOdometer / MAINTENANCE_INTERVAL) > Math.floor((currentOdometer - tripDistanceKm) / MAINTENANCE_INTERVAL)) {
-                    const issueDesc = `Scheduled Service: Odometer reached milestone of ${currentOdometer.toFixed(1)} km.`;
-                    
-                    await db.execute(
-                        'INSERT INTO maintenance_alerts (vehicle_id, trigger_mileage, issue_description, status) VALUES (?, ?, ?, "Pending")',
-                        [vehicleId, currentOdometer, issueDesc]
-                    );
-                    console.log(`⚠️ Predictive Maintenance Alert Generated for Vehicle ${vehicleId}`);
-                }
-            }
-            // ---------------------------------------------
-
-            // 3. Notify backend server via HTTP to broadcast arrival via WebSockets
-            try {
-                await fetch('http://localhost:5000/api/telemetry/complete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        trip_id: tripId, 
-                        vehicle_id: vehicleId, 
-                        destination: destinationName, 
-                        secret: SIMULATOR_SECRET 
-                    })
-                });
-            } catch (err) {
-                console.error("Failed to broadcast trip completion:", err.message);
-            }
-        }
-
-        activeSimulations.delete(tripId);
+    } catch (error) {
+        console.error(`Cannot reach the API at ${API_URL}: ${error.message}`);
     }
+}
 
-    // Check database every 5 seconds ONLY for new/pending trips
-    setInterval(async () => {
-        try {
-            const [trips] = await db.execute('SELECT * FROM trips WHERE status IN ("Active", "Pending", "active", "pending")');
-            
-            for (const trip of trips) {
-                if (!activeSimulations.has(trip.trip_id)) {
-                    activeSimulations.add(trip.trip_id); 
-                    simulateTrip(trip.trip_id, trip.destination);
-                }
-            }
-        } catch (error) {
-            console.error("Database scan error:", error.message);
-        }
-    }, 5000);
-} 
-
-runSimulator();
+console.log(`GPS simulator started. API: ${API_URL}. Waiting for Active trips...`);
+poll();
+setInterval(poll, 4000);

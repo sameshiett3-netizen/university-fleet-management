@@ -1,12 +1,14 @@
 const express = require('express');
-const router = express.Router();
-const { addVehicle, getVehicles } = require('../controllers/vehicleController');
+const c = require('../controllers/vehicleController');
 const { verifyToken, requireAdmin } = require('../middleware/authMiddleware');
 
-// GET /api/vehicles - Anyone logged in can view the fleet
-router.get('/', verifyToken, getVehicles);
+const router = express.Router();
+router.use(verifyToken, requireAdmin);
 
-// POST /api/vehicles - ONLY Admins can add a new vehicle to the fleet
-router.post('/', verifyToken, requireAdmin, addVehicle);
+router.get('/', c.getVehicles);
+router.post('/', c.addVehicle);
+router.put('/:id', c.updateVehicle);
+router.delete('/:id', c.deactivateVehicle);
+router.put('/:id/status', c.setVehicleStatus);
 
 module.exports = router;
